@@ -1,4 +1,5 @@
 import argparse
+import os
 import pickle
 import time
 from abc import abstractmethod
@@ -11,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup as bs
 from ebooklib import ITEM_DOCUMENT, epub
 from rich import print
+from tqdm import tqdm
 
 from utils import LANGUAGES, TO_LANGUAGE_CODE
 
@@ -20,8 +22,16 @@ RESUME = False
 
 
 class Base:
-    def __init__(self, key, language):
-        pass
+    def __init__(self, key, language, api_base=None):
+        self.key = key
+        self.language = language
+        self.current_key_index = 0
+
+    def get_key(self, key_str):
+        keys = key_str.split(",")
+        key = keys[self.current_key_index]
+        self.current_key_index = (self.current_key_index + 1) % len(keys)
+        return key
 
     @abstractmethod
     def translate(self, text):
@@ -29,12 +39,15 @@ class Base:
 
 
 class GPT3(Base):
-    def __init__(self, key, language):
+    def __init__(self, key, language, api_base=None):
+        super().__init__(key, language)
         self.api_key = key
-        self.api_url = "https://api.openai.com/v1/completions"
+        if not api_base:
+            self.api_url = "https://api.openai.com/v1/completions"
+        else:
+            self.api_url = api_base + "v1/completions"
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
         }
         # TODO support more models here
         self.data = {
@@ -49,6 +62,7 @@ class GPT3(Base):
 
     def translate(self, text):
         print(text)
+        self.headers["Authorization"] = f"Bearer {self.get_key(self.api_key)}"
         self.data["prompt"] = f"Please help me to translate，`{text}` to {self.language}"
         r = self.session.post(self.api_url, headers=self.headers, json=self.data)
         if not r.ok:
@@ -59,22 +73,24 @@ class GPT3(Base):
 
 
 class DeepL(Base):
-    def __init__(self, session, key):
-        super().__init__(session, key)
+    def __init__(self, session, key, api_base=None):
+        super().__init__(session, key, api_base=api_base)
 
     def translate(self, text):
         return super().translate(text)
 
 
 class ChatGPT(Base):
-    def __init__(self, key, language):
-        super().__init__(key, language)
+    def __init__(self, key, language, api_base=None):
+        super().__init__(key, language, api_base=api_base)
         self.key = key
         self.language = language
+        if api_base:
+            openai.api_base = api_base
 
     def translate(self, text):
         print(text)
-        openai.api_key = self.key
+        openai.api_key = self.get_key(self.key)
         try:
             completion = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
@@ -82,7 +98,7 @@ class ChatGPT(Base):
                     {
                         "role": "user",
                         # english prompt here to save tokens
-                        "content": f"Please help me to translate，`{text}` to {self.language}, please return only translated content not include the origin text",
+                        "content": f"Please help me to translate,`{text}` to {self.language}, please return only translated content not include the origin text",
                     }
                 ],
             )
@@ -97,15 +113,18 @@ class ChatGPT(Base):
                 # for time limit
                 time.sleep(3)
         except Exception as e:
-            print(str(e), "will sleep 60 seconds")
             # TIME LIMIT for open api please pay
-            time.sleep(60)
+            key_len = self.key.count(",") + 1
+            sleep_time = int(60 / key_len)
+            time.sleep(sleep_time)
+            print(str(e), "will sleep  " + str(sleep_time) + " seconds")
+            openai.api_key = self.get_key(self.key)
             completion = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {
                         "role": "user",
-                        "content": f"Please help me to translate，`{text}` to Simplified Chinese, please return only translated content not include the origin text",
+                        "content": f"Please help me to translate,`{text}` to {self.language}, please return only translated content not include the origin text",
                     }
                 ],
             )
@@ -121,10 +140,10 @@ class ChatGPT(Base):
 
 
 class BEPUB:
-    def __init__(self, epub_name, model, key, resume, language):
+    def __init__(self, epub_name, model, key, resume, language, model_api_base=None):
         self.epub_name = epub_name
         self.new_epub = epub.EpubBook()
-        self.translate_model = model(key, language)
+        self.translate_model = model(key, language, model_api_base)
         self.origin_book = epub.read_epub(self.epub_name)
         self.p_to_save = []
         self.resume = resume
@@ -143,14 +162,21 @@ class BEPUB:
         new_book.toc = self.origin_book.toc
         all_items = list(self.origin_book.get_items())
         # we just translate tag p
-        all_p_length = sum(
-            [len(bs(i.content, "html.parser").findAll("p")) for i in all_items]
-        )
-        print("TODO need process bar here: " + str(all_p_length))
+        all_p_length = 0
+        for i in all_items:
+            if i.file_name.endswith(".xhtml"):
+                all_p_length += len(bs(i.content, "html.parser").findAll("p"))
+            else:
+                all_p_length += len(bs(i.content, "xml").findAll("p"))
+        if IS_TEST:
+            pbar = tqdm(total=TEST_NUM)
+        else:
+            pbar = tqdm(total=all_p_length)
         index = 0
         p_to_save_len = len(self.p_to_save)
         try:
             for i in self.origin_book.get_items():
+                pbar.update(index)
                 if i.get_type() == 9:
                     soup = bs(i.content, "html.parser")
                     p_list = soup.findAll("p")
@@ -174,6 +200,7 @@ class BEPUB:
                 new_book.add_item(i)
             name = self.epub_name.split(".")[0]
             epub.write_epub(f"{name}_bilingual.epub", new_book, {})
+            pbar.close()
         except (KeyboardInterrupt, Exception) as e:
             print(e)
             print("you can resume it next time")
@@ -242,20 +269,21 @@ if __name__ == "__main__":
         "--book_name",
         dest="book_name",
         type=str,
-        help="your epub book name",
+        help="your epub book file path",
     )
     parser.add_argument(
         "--openai_key",
         dest="openai_key",
         type=str,
         default="",
-        help="openai api key",
+        help="openai api key,if you have more than one key,you can use comma"
+             " to split them and you can break through the limitation",
     )
     parser.add_argument(
         "--no_limit",
         dest="no_limit",
         action="store_true",
-        help="if you pay add it",
+        help="If you are a paying customer you can add it",
     )
     parser.add_argument(
         "--test",
@@ -270,7 +298,6 @@ if __name__ == "__main__":
         default=10,
         help="test num for the test",
     )
-
     parser.add_argument(
         "-m",
         "--model",
@@ -278,7 +305,7 @@ if __name__ == "__main__":
         type=str,
         default="chatgpt",
         choices=["chatgpt", "gpt3"],  # support DeepL later
-        help="Use which model",
+        help="Which model to use",
     )
     parser.add_argument(
         "--language",
@@ -294,10 +321,31 @@ if __name__ == "__main__":
         action="store_true",
         help="if program accidentally stop you can use this to resume",
     )
+    parser.add_argument(
+        "-p",
+        "--proxy",
+        dest="proxy",
+        type=str,
+        default="",
+        help="use proxy like http://127.0.0.1:7890",
+    )
+    # args to change api_base
+    parser.add_argument(
+        "--api_base",
+        dest="api_base",
+        type=str,
+        help="replace base url from openapi",
+    )
+
     options = parser.parse_args()
     NO_LIMIT = options.no_limit
     IS_TEST = options.test
     TEST_NUM = options.test_num
+    PROXY = options.proxy
+    if PROXY != "":
+        os.environ["http_proxy"] = PROXY
+        os.environ["https_proxy"] = PROXY
+
     OPENAI_API_KEY = options.openai_key or env.get("OPENAI_API_KEY")
     RESUME = options.resume
     if not OPENAI_API_KEY:
@@ -310,5 +358,14 @@ if __name__ == "__main__":
         # use the value for prompt
         language = LANGUAGES.get(language, language)
 
-    e = BEPUB(options.book_name, model, OPENAI_API_KEY, RESUME, language=language)
+    # change api_base for issue #42
+    model_api_base = options.api_base
+    e = BEPUB(
+        options.book_name,
+        model,
+        OPENAI_API_KEY,
+        RESUME,
+        language=language,
+        model_api_base=model_api_base,
+    )
     e.make_bilingual_book()
